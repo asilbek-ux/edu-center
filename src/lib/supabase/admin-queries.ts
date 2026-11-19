@@ -1,6 +1,7 @@
 'use server';
 
 import { createServerSupabaseClient } from './server';
+import { createAdminSupabaseClient } from './admin';
 import { requireAdminServerAuth } from './auth-actions';
 import {
   normalizeUzPhone,
@@ -426,6 +427,66 @@ export async function fetchStudentFullDetails(studentId: string) {
 }
 
 /**
+ * Helper to ensure an auth.users record exists for a profile before inserting into public.profiles.
+ * Strictly adheres to foreign key constraint: profiles.id REFERENCES auth.users(id).
+ */
+async function getOrCreateAuthUser(
+  adminClient: ReturnType<typeof createAdminSupabaseClient>,
+  email: string,
+  fullName: string,
+  phone: string,
+  role: UserRole,
+  defaultPassword?: string
+): Promise<{ id: string; errorUz?: string }> {
+  try {
+    const cleanEmail = email.trim().toLowerCase();
+
+    // 1. Check if user already exists in auth.users
+    const { data: usersData, error: listError } = await adminClient.auth.admin.listUsers({ page: 1, perPage: 100 });
+    if (!listError && usersData?.users) {
+      const found = usersData.users.find((u) => u.email?.toLowerCase() === cleanEmail);
+      if (found) {
+        return { id: found.id };
+      }
+    }
+
+    // 2. Create user via Supabase Auth Admin API
+    const password = defaultPassword || `Edu${role.charAt(0).toUpperCase() + role.slice(1)}_2026!`;
+    const { data: created, error: createError } = await adminClient.auth.admin.createUser({
+      email: cleanEmail,
+      password,
+      email_confirm: true,
+      user_metadata: {
+        full_name: fullName,
+        phone,
+        role,
+      },
+    });
+
+    if (createError) {
+      if (
+        createError.message?.toLowerCase().includes('already registered') ||
+        createError.message?.toLowerCase().includes('already exists')
+      ) {
+        const { data: retryList } = await adminClient.auth.admin.listUsers({ page: 1, perPage: 100 });
+        const retryFound = (retryList?.users || []).find((u) => u.email?.toLowerCase() === cleanEmail);
+        if (retryFound) return { id: retryFound.id };
+      }
+      return { id: '', errorUz: "Auth foydalanuvchisini yaratishda xatolik: " + createError.message };
+    }
+
+    if (!created?.user?.id) {
+      return { id: '', errorUz: "Auth foydalanuvchi ID olinmadi." };
+    }
+
+    return { id: created.user.id };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Auth foydalanuvchisini yaratishda kutilmagan xatolik yuz berdi.";
+    return { id: '', errorUz: msg };
+  }
+}
+
+/**
  * 4. Create Student with Profile, Parent Link, and Group Enrollment
  */
 export async function createStudentInSupabase(payload: {
@@ -447,7 +508,7 @@ export async function createStudentInSupabase(payload: {
       return { success: false, errorUz: valid.errorUz };
     }
 
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
     const cleanData = valid.data!;
 
     // 1. Generate unique student code: EDU-YYYY-XXXX
@@ -455,85 +516,152 @@ export async function createStudentInSupabase(payload: {
     const randomSeq = Math.floor(1000 + Math.random() * 9000);
     const studentCode = `EDU-${currentYear}-${randomSeq}`;
 
-    // 2. Generate random UUID for student profile
-    const studentProfileId = crypto.randomUUID();
-    const studentEmail = cleanData.email || `student.${randomSeq}@educenter.uz`;
+    // 2. Determine student email
+    const studentDigits = cleanData.phone.replace(/\D/g, '').slice(-9);
+    const studentEmail = cleanData.email || `std_${studentDigits}@educenter.uz`;
 
-    // Insert Student Profile
-    const { error: errStudentProf } = await supabase.from('profiles').insert({
-      id: studentProfileId,
-      role: 'student' as UserRole,
-      full_name: cleanData.fullName,
-      phone: cleanData.phone,
-      email: studentEmail,
-      is_active: true,
-    });
+    // 3. Ensure student exists in auth.users FIRST (satisfies profiles_id_fkey)
+    const authResult = await getOrCreateAuthUser(
+      adminClient,
+      studentEmail,
+      cleanData.fullName,
+      cleanData.phone,
+      'student',
+      'EduStudent_2026!'
+    );
+
+    if (authResult.errorUz || !authResult.id) {
+      return { success: false, errorUz: authResult.errorUz || "O'quvchi Auth hisobini yaratib bo'lmadi." };
+    }
+
+    const studentProfileId = authResult.id;
+
+    // 4. Upsert Student Profile in public.profiles using the exact auth.users.id
+    const { error: errStudentProf } = await adminClient.from('profiles').upsert(
+      {
+        id: studentProfileId,
+        role: 'student' as UserRole,
+        full_name: cleanData.fullName,
+        phone: cleanData.phone,
+        email: studentEmail,
+        is_active: true,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'id' }
+    );
+
     if (errStudentProf) {
       return { success: false, errorUz: "O'quvchi profilini yaratishda xatolik: " + errStudentProf.message };
     }
 
-    // Insert Student Entity
-    const { data: studentRecord, error: errStudentRecord } = await supabase
+    // 5. Insert Student Entity in public.students
+    let { data: studentRecord, error: errStudentRecord } = await adminClient
       .from('students')
-      .insert({
-        profile_id: studentProfileId,
-        student_code: studentCode,
-        birth_date: cleanData.birthDate || null,
-        school_grade: cleanData.schoolGrade || null,
-        notes: cleanData.notes || null,
-        xp_total: 0,
-        current_level: 1,
-        streak_days: 0,
-        enrolled_at: new Date().toISOString().slice(0, 10),
-      })
-      .select()
-      .single();
+      .select('*')
+      .eq('profile_id', studentProfileId)
+      .maybeSingle();
 
-    if (errStudentRecord) {
-      return { success: false, errorUz: "O'quvchi yozuvini yaratishda xatolik: " + errStudentRecord.message };
+    if (!studentRecord) {
+      const { data: newStd, error: insertStdErr } = await adminClient
+        .from('students')
+        .insert({
+          profile_id: studentProfileId,
+          student_code: studentCode,
+          birth_date: cleanData.birthDate || null,
+          school_grade: cleanData.schoolGrade || null,
+          notes: cleanData.notes || null,
+          xp_total: 0,
+          current_level: 1,
+          streak_days: 0,
+          enrolled_at: new Date().toISOString().slice(0, 10),
+        })
+        .select()
+        .single();
+
+      if (insertStdErr || !newStd) {
+        return {
+          success: false,
+          errorUz: "O'quvchi yozuvini yaratishda xatolik: " + (insertStdErr?.message || "Noma'lum xato"),
+        };
+      }
+      studentRecord = newStd;
     }
 
-    // 3. Create or Link Parent Profile
-    const parentProfileId = crypto.randomUUID();
-    const parentEmail = `parent.${randomSeq}@educenter.uz`;
+    // 6. Parent Account & Profile
+    if (cleanData.parentName && cleanData.parentPhone) {
+      const parentDigits = cleanData.parentPhone.replace(/\D/g, '').slice(-9);
+      const parentEmail = `prt_${parentDigits}@educenter.uz`;
 
-    await supabase.from('profiles').insert({
-      id: parentProfileId,
-      role: 'parent' as UserRole,
-      full_name: cleanData.parentName,
-      phone: cleanData.parentPhone,
-      email: parentEmail,
-      is_active: true,
-    });
+      const parentAuthResult = await getOrCreateAuthUser(
+        adminClient,
+        parentEmail,
+        cleanData.parentName,
+        cleanData.parentPhone,
+        'parent',
+        'EduParent_2026!'
+      );
 
-    const { data: parentRecord } = await supabase
-      .from('parents')
-      .insert({
-        profile_id: parentProfileId,
-        emergency_phone: cleanData.parentPhone,
-      })
-      .select()
-      .single();
+      if (parentAuthResult.id) {
+        const parentProfileId = parentAuthResult.id;
 
-    if (parentRecord) {
-      await supabase.from('parent_students').insert({
-        parent_id: parentRecord.id,
-        student_id: studentRecord.id,
-        relationship: cleanData.parentRelationship || 'Ota-ona',
-        is_primary_payer: true,
-      });
+        await adminClient.from('profiles').upsert(
+          {
+            id: parentProfileId,
+            role: 'parent' as UserRole,
+            full_name: cleanData.parentName,
+            phone: cleanData.parentPhone,
+            email: parentEmail,
+            is_active: true,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'id' }
+        );
+
+        let { data: parentRecord } = await adminClient
+          .from('parents')
+          .select('id')
+          .eq('profile_id', parentProfileId)
+          .maybeSingle();
+
+        if (!parentRecord) {
+          const { data: newParent } = await adminClient
+            .from('parents')
+            .insert({
+              profile_id: parentProfileId,
+              emergency_phone: cleanData.parentPhone,
+            })
+            .select('id')
+            .maybeSingle();
+          parentRecord = newParent;
+        }
+
+        if (parentRecord && studentRecord) {
+          await adminClient.from('parent_students').upsert(
+            {
+              parent_id: parentRecord.id,
+              student_id: studentRecord.id,
+              relationship: cleanData.parentRelationship || 'Ota-ona',
+              is_primary_payer: true,
+            },
+            { onConflict: 'parent_id,student_id' }
+          );
+        }
+      }
     }
 
-    // 4. Enroll in group if selected
-    if (cleanData.groupId) {
-      await supabase.from('group_students').insert({
-        student_id: studentRecord.id,
-        group_id: cleanData.groupId,
-        status: 'active',
-      });
+    // 7. Enroll in group if selected
+    if (cleanData.groupId && studentRecord) {
+      await adminClient.from('group_students').upsert(
+        {
+          student_id: studentRecord.id,
+          group_id: cleanData.groupId,
+          status: 'active',
+        },
+        { onConflict: 'group_id,student_id' }
+      );
     }
 
-    return { success: true, studentRecord, studentCode };
+    return { success: true, studentRecord, studentCode: studentRecord.student_code || studentCode };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "O'quvchi yaratishda kutilmagan xatolik yuz berdi.";
     return { success: false, errorUz: msg };
@@ -557,7 +685,7 @@ export async function updateStudentInSupabase(payload: {
 }): Promise<{ success: boolean; errorUz?: string }> {
   try {
     await requireAdminServerAuth();
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
 
     let cleanPhone = payload.phone.trim();
     if (cleanPhone) {
@@ -568,7 +696,7 @@ export async function updateStudentInSupabase(payload: {
       cleanPhone = norm.formatted;
     }
 
-    const { error: profErr } = await supabase
+    const { error: profErr } = await adminClient
       .from('profiles')
       .update({
         full_name: payload.fullName.trim(),
@@ -578,7 +706,7 @@ export async function updateStudentInSupabase(payload: {
       .eq('id', payload.profileId);
     if (profErr) return { success: false, errorUz: profErr.message };
 
-    const { error: stdErr } = await supabase
+    const { error: stdErr } = await adminClient
       .from('students')
       .update({
         birth_date: payload.birthDate || null,
@@ -627,10 +755,22 @@ export async function toggleStudentActiveStatus(profileId: string, isActive: boo
 export async function deleteStudentInSupabase(studentId: string, profileId: string): Promise<{ success: boolean; errorUz?: string }> {
   try {
     await requireAdminServerAuth();
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
 
-    const { error } = await supabase.from('profiles').delete().eq('id', profileId);
+    // 1. Delete student entity
+    await adminClient.from('students').delete().eq('id', studentId);
+
+    // 2. Delete profile
+    const { error } = await adminClient.from('profiles').delete().eq('id', profileId);
     if (error) return { success: false, errorUz: "O'quvchini o'chirishda xatolik: " + error.message };
+
+    // 3. Delete auth.users entry if exists
+    try {
+      await adminClient.auth.admin.deleteUser(profileId);
+    } catch {
+      // Ignored if auth user was already removed or didn't exist
+    }
+
     return { success: true };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "O'chirishda xatolik yuz berdi.";
@@ -722,41 +862,71 @@ export async function createTeacherInSupabase(payload: {
       return { success: false, errorUz: valid.errorUz };
     }
 
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
     const clean = valid.data!;
 
     const employeeCode = `TCH-${Math.floor(100 + Math.random() * 900)}`;
-    const profileId = crypto.randomUUID();
 
-    const { error: profErr } = await supabase.from('profiles').insert({
-      id: profileId,
-      role: 'teacher' as UserRole,
-      full_name: clean.fullName,
-      phone: clean.phone,
-      email: clean.email,
-      is_active: true,
-    });
+    // Ensure teacher exists in auth.users FIRST (satisfies profiles_id_fkey)
+    const authResult = await getOrCreateAuthUser(
+      adminClient,
+      clean.email,
+      clean.fullName,
+      clean.phone,
+      'teacher',
+      'EduTeacher_2026!'
+    );
+
+    if (authResult.errorUz || !authResult.id) {
+      return { success: false, errorUz: authResult.errorUz || "O'qituvchi Auth hisobini yaratib bo'lmadi." };
+    }
+
+    const profileId = authResult.id;
+
+    // Upsert teacher profile in public.profiles
+    const { error: profErr } = await adminClient.from('profiles').upsert(
+      {
+        id: profileId,
+        role: 'teacher' as UserRole,
+        full_name: clean.fullName,
+        phone: clean.phone,
+        email: clean.email,
+        is_active: true,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'id' }
+    );
     if (profErr) {
       return { success: false, errorUz: "O'qituvchi profilini yaratishda xatolik: " + profErr.message };
     }
 
-    const { data: teacher, error: tchErr } = await supabase
+    let { data: teacher } = await adminClient
       .from('teachers')
-      .insert({
-        profile_id: profileId,
-        employee_code: employeeCode,
-        specialization: clean.specialization,
-        salary_rate_uzs: clean.salaryRateUzs,
-        bio: clean.bio || null,
-        hired_at: new Date().toISOString().slice(0, 10),
-      })
-      .select()
-      .single();
+      .select('*')
+      .eq('profile_id', profileId)
+      .maybeSingle();
 
-    if (tchErr) {
-      return { success: false, errorUz: "O'qituvchi ma'lumotlarini saqlashda xatolik: " + tchErr.message };
+    if (!teacher) {
+      const { data: newTch, error: tchErr } = await adminClient
+        .from('teachers')
+        .insert({
+          profile_id: profileId,
+          employee_code: employeeCode,
+          specialization: clean.specialization,
+          salary_rate_uzs: clean.salaryRateUzs,
+          bio: clean.bio || null,
+          hired_at: new Date().toISOString().slice(0, 10),
+        })
+        .select()
+        .single();
+
+      if (tchErr) {
+        return { success: false, errorUz: "O'qituvchi ma'lumotlarini saqlashda xatolik: " + tchErr.message };
+      }
+      teacher = newTch;
     }
-    return { success: true, teacher, employeeCode };
+
+    return { success: true, teacher, employeeCode: teacher.employee_code || employeeCode };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "O'qituvchi yaratishda kutilmagan xatolik yuz berdi.";
     return { success: false, errorUz: msg };
@@ -777,7 +947,7 @@ export async function updateTeacherInSupabase(payload: {
 }): Promise<{ success: boolean; errorUz?: string }> {
   try {
     await requireAdminServerAuth();
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
 
     let cleanPhone = payload.phone.trim();
     if (cleanPhone) {
@@ -788,7 +958,7 @@ export async function updateTeacherInSupabase(payload: {
       cleanPhone = norm.formatted;
     }
 
-    const { error: profErr } = await supabase
+    const { error: profErr } = await adminClient
       .from('profiles')
       .update({
         full_name: payload.fullName.trim(),
@@ -798,7 +968,7 @@ export async function updateTeacherInSupabase(payload: {
       .eq('id', payload.profileId);
     if (profErr) return { success: false, errorUz: profErr.message };
 
-    const { error: tchErr } = await supabase
+    const { error: tchErr } = await adminClient
       .from('teachers')
       .update({
         specialization: payload.specialization,
