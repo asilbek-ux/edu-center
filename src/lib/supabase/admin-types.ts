@@ -106,6 +106,13 @@ export interface AdminGroupRow {
   enrolledCount: number;
   status: 'active' | 'forming' | 'completed' | 'paused';
   startDate: string;
+  enrolledStudents?: Array<{
+    id: string;
+    studentId: string;
+    code: string;
+    name: string;
+    phone: string;
+  }>;
 }
 
 export interface AdminAttendanceHistoryRow {

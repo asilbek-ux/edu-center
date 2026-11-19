@@ -205,6 +205,7 @@ export function validateGroupInput(input: {
   startTime: string;
   endTime: string;
   maxStudents: number;
+  status?: string;
 }): ValidationResult<typeof input> {
   if (!input.code || input.code.trim().length < 2) {
     return { success: false, errorUz: "Guruh kodi kiritilishi shart (masalan: ROB-01)." };

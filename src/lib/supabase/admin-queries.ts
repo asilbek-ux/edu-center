@@ -256,7 +256,8 @@ export async function fetchAdminStudentsList(): Promise<AdminStudentRow[]> {
 
   return (rows || []).map((r: Record<string, any>) => {
     const prof = Array.isArray(r.profiles) ? r.profiles[0] : r.profiles;
-    const enrollments = Array.isArray(r.group_students) ? r.group_students : [];
+    const enrollments = (Array.isArray(r.group_students) ? r.group_students : [])
+      .filter((gs: Record<string, any>) => gs.status === 'active');
     const groupCodes = enrollments
       .map((gs: Record<string, any>) => gs.groups?.code)
       .filter(Boolean) as string[];
@@ -717,8 +718,13 @@ export async function updateStudentInSupabase(payload: {
       .eq('id', payload.studentId);
     if (stdErr) return { success: false, errorUz: stdErr.message };
 
-    if (payload.groupId) {
-      await assignStudentToGroupInSupabase(payload.studentId, payload.groupId);
+    if (payload.groupId !== undefined) {
+      if (payload.groupId && payload.groupId.trim()) {
+        const assignRes = await assignStudentToGroupInSupabase(payload.studentId, payload.groupId.trim());
+        if (!assignRes.success) return assignRes;
+      } else {
+        await removeStudentFromGroupInSupabase(payload.studentId);
+      }
     }
 
     return { success: true };
@@ -1091,7 +1097,17 @@ export async function fetchAdminCoursesAndGroups(): Promise<{
             )
           ),
           group_students (
-            id
+            id,
+            status,
+            student_id,
+            students:student_id (
+              id,
+              student_code,
+              profiles:profile_id (
+                full_name,
+                phone
+              )
+            )
           )
         `
         )
@@ -1122,7 +1138,20 @@ export async function fetchAdminCoursesAndGroups(): Promise<{
   });
 
   const groups: AdminGroupRow[] = (groupRows || []).map((g: Record<string, any>) => {
-    const enrolledList = Array.isArray(g.group_students) ? g.group_students : [];
+    const enrolledRaw = Array.isArray(g.group_students) ? g.group_students : [];
+    const activeEnrolled = enrolledRaw.filter((gs: Record<string, any>) => gs.status === 'active');
+    const enrolledStudents = activeEnrolled.map((gs: Record<string, any>) => {
+      const std = Array.isArray(gs.students) ? gs.students[0] : gs.students;
+      const prof = Array.isArray(std?.profiles) ? std?.profiles[0] : std?.profiles;
+      return {
+        id: gs.id,
+        studentId: gs.student_id || std?.id,
+        code: std?.student_code || '—',
+        name: prof?.full_name || "Noma'lum",
+        phone: prof?.phone || '—',
+      };
+    });
+
     const teacherProf = Array.isArray(g.teachers?.profiles)
       ? g.teachers?.profiles[0]
       : g.teachers?.profiles;
@@ -1141,9 +1170,10 @@ export async function fetchAdminCoursesAndGroups(): Promise<{
       startTime: String(g.start_time || '15:00').slice(0, 5),
       endTime: String(g.end_time || '17:00').slice(0, 5),
       maxStudents: Number(g.max_students || 15),
-      enrolledCount: enrolledList.length,
+      enrolledCount: activeEnrolled.length,
       status: g.status,
       startDate: g.start_date || '',
+      enrolledStudents,
     };
   });
 
@@ -1260,11 +1290,11 @@ export async function createGroupInSupabase(payload: {
     const valid = validateGroupInput(payload);
     if (!valid.success) return { success: false, errorUz: valid.errorUz };
 
-    const supabase = createServerSupabaseClient();
+    const adminClient = createAdminSupabaseClient();
     const clean = valid.data!;
 
-    // Conflict check with existing groups
-    const { data: conflicts } = await supabase
+    // Conflict check with existing active groups
+    const { data: conflicts } = await adminClient
       .from('groups')
       .select('id, code, name, room, teacher_id')
       .eq('status', 'active')
@@ -1283,7 +1313,7 @@ export async function createGroupInSupabase(payload: {
       };
     }
 
-    const { data, error } = await supabase
+    const { data, error } = await adminClient
       .from('groups')
       .insert({
         code: clean.code,
@@ -1301,7 +1331,12 @@ export async function createGroupInSupabase(payload: {
       .select()
       .single();
 
-    if (error) return { success: false, errorUz: error.message };
+    if (error) {
+      if (error.message.includes('groups_code_key') || error.code === '23505') {
+        return { success: false, errorUz: `Bu kodli guruh (${clean.code}) allaqachon mavjud.` };
+      }
+      return { success: false, errorUz: error.message };
+    }
     return { success: true, group: data };
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Guruh yaratishda xatolik yuz berdi.";
@@ -1310,44 +1345,197 @@ export async function createGroupInSupabase(payload: {
 }
 
 /**
- * 16. Assign Student to Group with Capacity Enforcement
+ * Update Group Details
  */
-export async function assignStudentToGroupInSupabase(studentId: string, groupId: string): Promise<{ success: boolean; errorUz?: string }> {
+export async function updateGroupInSupabase(payload: {
+  groupId: string;
+  code: string;
+  name: string;
+  courseId: string;
+  teacherId: string;
+  room: string;
+  scheduleDays: string;
+  startTime: string;
+  endTime: string;
+  maxStudents: number;
+  status?: 'active' | 'forming' | 'completed' | 'paused';
+}): Promise<{ success: boolean; errorUz?: string }> {
   try {
     await requireAdminServerAuth();
-    const supabase = createServerSupabaseClient();
+    const valid = validateGroupInput(payload);
+    if (!valid.success) return { success: false, errorUz: valid.errorUz };
 
-    // Check group capacity
-    const { data: group, error: grpErr } = await supabase
+    const adminClient = createAdminSupabaseClient();
+    const clean = valid.data!;
+
+    // Conflict check with other groups
+    const { data: conflicts } = await adminClient
       .from('groups')
-      .select('id, code, max_students, group_students(id)')
+      .select('id, code, name, room, teacher_id')
+      .eq('status', 'active')
+      .neq('id', payload.groupId)
+      .eq('schedule_days', clean.scheduleDays)
+      .or(`room.eq.${clean.room},teacher_id.eq.${clean.teacherId}`)
+      .filter('start_time', 'lt', clean.endTime)
+      .filter('end_time', 'gt', clean.startTime);
+
+    if (conflicts && conflicts.length > 0) {
+      const c = conflicts[0];
+      const isRoom = c.room === clean.room;
+      return {
+        success: false,
+        errorUz: `Jadval to'qnashuvi aniqlandi: ${c.code} (${c.name}) guruhi ushbu vaqtda ` +
+          (isRoom ? `'${clean.room}' xonasini band qilgan.` : "ushbu o'qituvchiga dars belgilangan."),
+      };
+    }
+
+    const { error } = await adminClient
+      .from('groups')
+      .update({
+        code: clean.code,
+        name: clean.name,
+        course_id: clean.courseId,
+        teacher_id: clean.teacherId,
+        room: clean.room,
+        schedule_days: clean.scheduleDays,
+        start_time: clean.startTime,
+        end_time: clean.endTime,
+        max_students: clean.maxStudents,
+        status: payload.status || 'active',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.groupId);
+
+    if (error) {
+      if (error.message.includes('groups_code_key') || error.code === '23505') {
+        return { success: false, errorUz: `Bu kodli guruh (${clean.code}) allaqachon mavjud.` };
+      }
+      return { success: false, errorUz: error.message };
+    }
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Guruhni yangilashda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
+}
+
+/**
+ * Delete Group Record
+ */
+export async function deleteGroupInSupabase(groupId: string): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const adminClient = createAdminSupabaseClient();
+
+    const { error } = await adminClient.from('groups').delete().eq('id', groupId);
+    if (error) {
+      return { success: false, errorUz: "Guruhni o'chirishda xatolik: " + error.message };
+    }
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Guruhni o'chirishda kutilmagan xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
+}
+
+/**
+ * 16. Assign Student to Group with Capacity Enforcement and Single-Active-Group Guarantee
+ */
+export async function assignStudentToGroupInSupabase(
+  studentId: string,
+  groupId: string
+): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const adminClient = createAdminSupabaseClient();
+
+    if (!studentId || !groupId) {
+      return { success: false, errorUz: "O'quvchi va guruh tanlanishi shart." };
+    }
+
+    // 1. Check group existence and capacity
+    const { data: group, error: grpErr } = await adminClient
+      .from('groups')
+      .select('id, code, name, max_students, group_students(id, student_id, status)')
       .eq('id', groupId)
       .single();
 
-    if (grpErr || !group) return { success: false, errorUz: "Guruh topilmadi." };
-
-    const currentCount = (group.group_students || []).length;
-    if (currentCount >= group.max_students) {
-      return { success: false, errorUz: `Guruh to'lgan (${currentCount}/${group.max_students} o'quvchi). Boshqa guruhni tanlang.` };
+    if (grpErr || !group) {
+      return { success: false, errorUz: "Tanlangan guruh topilmadi." };
     }
 
-    const { error } = await supabase
+    const activeEnrollments = (group.group_students || []).filter(
+      (gs: { student_id: string; status: string }) => gs.status === 'active'
+    );
+    const isAlreadyEnrolled = activeEnrollments.some(
+      (gs: { student_id: string; status: string }) => gs.student_id === studentId
+    );
+
+    if (!isAlreadyEnrolled && activeEnrollments.length >= group.max_students) {
+      return {
+        success: false,
+        errorUz: `Guruh to'lgan (${activeEnrollments.length}/${group.max_students} o'quvchi). Boshqa guruhni tanlang.`,
+      };
+    }
+
+    // 2. Remove any other active group enrollments for this student (clean transfer guarantee)
+    await adminClient
+      .from('group_students')
+      .delete()
+      .eq('student_id', studentId)
+      .neq('group_id', groupId);
+
+    // 3. Upsert target enrollment
+    const today = new Date().toISOString().slice(0, 10);
+    const { error: enrollErr } = await adminClient
       .from('group_students')
       .upsert(
         {
           student_id: studentId,
           group_id: groupId,
           status: 'active',
+          joined_at: today,
+          enrolled_at: today,
         },
         { onConflict: 'group_id,student_id' }
-      )
-      .select()
-      .single();
+      );
 
-    if (error) return { success: false, errorUz: error.message };
+    if (enrollErr) {
+      return { success: false, errorUz: "Guruhga biriktirishda xatolik: " + enrollErr.message };
+    }
+
     return { success: true };
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Guruhga biriktirishda xatolik yuz berdi.";
+    const msg = err instanceof Error ? err.message : "Guruhga biriktirishda kutilmagan xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
+}
+
+/**
+ * Remove student from a group or all active groups (make Guruhsiz)
+ */
+export async function removeStudentFromGroupInSupabase(
+  studentId: string,
+  groupId?: string
+): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const adminClient = createAdminSupabaseClient();
+
+    let query = adminClient.from('group_students').delete().eq('student_id', studentId);
+    if (groupId) {
+      query = query.eq('group_id', groupId);
+    }
+
+    const { error } = await query;
+    if (error) {
+      return { success: false, errorUz: "Guruhdan chiqarishda xatolik: " + error.message };
+    }
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Guruhdan chiqarishda kutilmagan xatolik yuz berdi.";
     return { success: false, errorUz: msg };
   }
 }
