@@ -270,8 +270,12 @@ export default function AdminDashboardPage() {
   const handleCreateStudent = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const { studentCode } = await createStudentInSupabase(studentForm);
-      showNotice(`Yangi o'quvchi (${studentCode}) muvaffaqiyatli ro'yxatdan o'tkazildi!`);
+      const res = await createStudentInSupabase(studentForm);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
+      showNotice(`Yangi o'quvchi (${res.studentCode || ''}) muvaffaqiyatli ro'yxatdan o'tkazildi!`);
       setShowCreateStudentModal(false);
       setStudentForm({
         fullName: '',
@@ -295,7 +299,7 @@ export default function AdminDashboardPage() {
     e.preventDefault();
     if (!editingStudent) return;
     try {
-      await updateStudentInSupabase({
+      const res = await updateStudentInSupabase({
         studentId: editingStudent.id,
         profileId: editingStudent.profileId,
         fullName: editingStudent.fullName,
@@ -305,6 +309,10 @@ export default function AdminDashboardPage() {
         groupId: editingStudent.groupId,
         notes: editingStudent.notes,
       });
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice("O'quvchi ma'lumotlari muvaffaqiyatli saqlandi!");
       setEditingStudent(null);
       loadData();
@@ -315,7 +323,11 @@ export default function AdminDashboardPage() {
 
   const handleToggleStudentActive = async (s: AdminStudentRow) => {
     try {
-      await toggleStudentActiveStatus(s.profileId, !s.isActive);
+      const res = await toggleStudentActiveStatus(s.profileId, !s.isActive);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice(`O'quvchi holati ${!s.isActive ? 'faollashtirildi' : 'nofaol qilindi'}.`);
       loadData();
     } catch (err: unknown) {
@@ -326,7 +338,11 @@ export default function AdminDashboardPage() {
   const handleDeleteStudent = async () => {
     if (!deletingStudent) return;
     try {
-      await deleteStudentInSupabase(deletingStudent.id, deletingStudent.profileId);
+      const res = await deleteStudentInSupabase(deletingStudent.id, deletingStudent.profileId);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice("O'quvchi tizimdan butunlay o'chirildi.");
       setDeletingStudent(null);
       loadData();
@@ -338,8 +354,12 @@ export default function AdminDashboardPage() {
   const handleCreateTeacher = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await createTeacherInSupabase(teacherForm);
-      showNotice("Yangi o'qituvchi muvaffaqiyatli qo'shildi!");
+      const res = await createTeacherInSupabase(teacherForm);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
+      showNotice(`Yangi o'qituvchi (${res.employeeCode || ''}) muvaffaqiyatli qo'shildi!`);
       setShowCreateTeacherModal(false);
       setTeacherForm({
         fullName: '',
@@ -359,7 +379,7 @@ export default function AdminDashboardPage() {
     e.preventDefault();
     if (!editingTeacher) return;
     try {
-      await updateTeacherInSupabase({
+      const res = await updateTeacherInSupabase({
         teacherId: editingTeacher.id,
         profileId: editingTeacher.profileId,
         fullName: editingTeacher.fullName,
@@ -368,6 +388,10 @@ export default function AdminDashboardPage() {
         salaryRateUzs: editingTeacher.salaryUzs,
         bio: editingTeacher.bio,
       });
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice("O'qituvchi ma'lumotlari muvaffaqiyatli yangilandi!");
       setEditingTeacher(null);
       loadData();
@@ -379,7 +403,11 @@ export default function AdminDashboardPage() {
   const handleCreateCourse = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await createCourseInSupabase(courseForm);
+      const res = await createCourseInSupabase(courseForm);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice(`Yangi kurs (${courseForm.code}) muvaffaqiyatli yaratildi!`);
       setShowCreateCourseModal(false);
       loadData();
@@ -392,13 +420,17 @@ export default function AdminDashboardPage() {
     e.preventDefault();
     if (!editingCourse) return;
     try {
-      await updateCourseInSupabase({
+      const res = await updateCourseInSupabase({
         courseId: editingCourse.id,
         titleUz: editingCourse.titleUz,
         monthlyFeeUzs: editingCourse.monthlyFeeUzs,
         durationMonths: editingCourse.durationMonths,
         lessonsPerWeek: editingCourse.lessonsPerWeek,
       });
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice("Kurs ma'lumotlari yangilandi!");
       setEditingCourse(null);
       loadData();
@@ -410,7 +442,11 @@ export default function AdminDashboardPage() {
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await createGroupInSupabase(groupForm);
+      const res = await createGroupInSupabase(groupForm);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice(`Yangi guruh (${groupForm.code}) jadval to'qnashuvisiz yaratildi!`);
       setShowCreateGroupModal(false);
       loadData();
@@ -422,7 +458,11 @@ export default function AdminDashboardPage() {
   const handleRecordPayment = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      await recordPaymentInSupabase(paymentForm);
+      const res = await recordPaymentInSupabase(paymentForm);
+      if (!res.success) {
+        alert(res.errorUz || "Xatolik yuz berdi.");
+        return;
+      }
       showNotice("To'lov muvaffaqiyatli qabul qilindi va kvitansiya yaratildi!");
       setShowRecordPaymentModal(false);
       loadData();

@@ -3,6 +3,7 @@
 import { createServerSupabaseClient } from './server';
 import { requireAdminServerAuth } from './auth-actions';
 import {
+  normalizeUzPhone,
   validateCourseInput,
   validateGroupInput,
   validatePaymentInput,
@@ -438,94 +439,105 @@ export async function createStudentInSupabase(payload: {
   parentRelationship?: string;
   groupId?: string;
   notes?: string;
-}) {
-  await requireAdminServerAuth();
-  const valid = validateStudentInput(payload);
-  if (!valid.success) throw new Error(valid.errorUz);
+}): Promise<{ success: boolean; studentCode?: string; studentRecord?: any; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const valid = validateStudentInput(payload);
+    if (!valid.success) {
+      return { success: false, errorUz: valid.errorUz };
+    }
 
-  const supabase = createServerSupabaseClient();
-  const cleanData = valid.data!;
+    const supabase = createServerSupabaseClient();
+    const cleanData = valid.data!;
 
-  // 1. Generate unique student code: EDU-YYYY-XXXX
-  const currentYear = new Date().getFullYear();
-  const randomSeq = Math.floor(1000 + Math.random() * 9000);
-  const studentCode = `EDU-${currentYear}-${randomSeq}`;
+    // 1. Generate unique student code: EDU-YYYY-XXXX
+    const currentYear = new Date().getFullYear();
+    const randomSeq = Math.floor(1000 + Math.random() * 9000);
+    const studentCode = `EDU-${currentYear}-${randomSeq}`;
 
-  // 2. Generate random UUID for student profile
-  const studentProfileId = crypto.randomUUID();
-  const studentEmail = cleanData.email || `student.${randomSeq}@educenter.uz`;
+    // 2. Generate random UUID for student profile
+    const studentProfileId = crypto.randomUUID();
+    const studentEmail = cleanData.email || `student.${randomSeq}@educenter.uz`;
 
-  // Insert Student Profile
-  const { error: errStudentProf } = await supabase.from('profiles').insert({
-    id: studentProfileId,
-    role: 'student' as UserRole,
-    full_name: cleanData.fullName,
-    phone: cleanData.phone,
-    email: studentEmail,
-    is_active: true,
-  });
-  if (errStudentProf) throw new Error("O'quvchi profilini yaratishda xatolik: " + errStudentProf.message);
-
-  // Insert Student Entity
-  const { data: studentRecord, error: errStudentRecord } = await supabase
-    .from('students')
-    .insert({
-      profile_id: studentProfileId,
-      student_code: studentCode,
-      birth_date: cleanData.birthDate || null,
-      school_grade: cleanData.schoolGrade || null,
-      notes: cleanData.notes || null,
-      xp_total: 0,
-      current_level: 1,
-      streak_days: 0,
-      enrolled_at: new Date().toISOString().slice(0, 10),
-    })
-    .select()
-    .single();
-
-  if (errStudentRecord) throw new Error("O'quvchi yozuvini yaratishda xatolik: " + errStudentRecord.message);
-
-  // 3. Create or Link Parent Profile
-  const parentProfileId = crypto.randomUUID();
-  const parentEmail = `parent.${randomSeq}@educenter.uz`;
-
-  await supabase.from('profiles').insert({
-    id: parentProfileId,
-    role: 'parent' as UserRole,
-    full_name: cleanData.parentName,
-    phone: cleanData.parentPhone,
-    email: parentEmail,
-    is_active: true,
-  });
-
-  const { data: parentRecord } = await supabase
-    .from('parents')
-    .insert({
-      profile_id: parentProfileId,
-      emergency_phone: cleanData.parentPhone,
-    })
-    .select()
-    .single();
-
-  if (parentRecord) {
-    await supabase.from('parent_students').insert({
-      parent_id: parentRecord.id,
-      student_id: studentRecord.id,
-      relationship: cleanData.parentRelationship || 'Ota-ona',
-      is_primary_payer: true,
+    // Insert Student Profile
+    const { error: errStudentProf } = await supabase.from('profiles').insert({
+      id: studentProfileId,
+      role: 'student' as UserRole,
+      full_name: cleanData.fullName,
+      phone: cleanData.phone,
+      email: studentEmail,
+      is_active: true,
     });
-  }
+    if (errStudentProf) {
+      return { success: false, errorUz: "O'quvchi profilini yaratishda xatolik: " + errStudentProf.message };
+    }
 
-  // 4. Enroll in group if selected
-  if (cleanData.groupId) {
-    await supabase.from('group_students').insert({
-      student_id: studentRecord.id,
-      group_id: cleanData.groupId,
-      status: 'active',
+    // Insert Student Entity
+    const { data: studentRecord, error: errStudentRecord } = await supabase
+      .from('students')
+      .insert({
+        profile_id: studentProfileId,
+        student_code: studentCode,
+        birth_date: cleanData.birthDate || null,
+        school_grade: cleanData.schoolGrade || null,
+        notes: cleanData.notes || null,
+        xp_total: 0,
+        current_level: 1,
+        streak_days: 0,
+        enrolled_at: new Date().toISOString().slice(0, 10),
+      })
+      .select()
+      .single();
+
+    if (errStudentRecord) {
+      return { success: false, errorUz: "O'quvchi yozuvini yaratishda xatolik: " + errStudentRecord.message };
+    }
+
+    // 3. Create or Link Parent Profile
+    const parentProfileId = crypto.randomUUID();
+    const parentEmail = `parent.${randomSeq}@educenter.uz`;
+
+    await supabase.from('profiles').insert({
+      id: parentProfileId,
+      role: 'parent' as UserRole,
+      full_name: cleanData.parentName,
+      phone: cleanData.parentPhone,
+      email: parentEmail,
+      is_active: true,
     });
-  }
 
-  return { studentRecord, studentCode };
+    const { data: parentRecord } = await supabase
+      .from('parents')
+      .insert({
+        profile_id: parentProfileId,
+        emergency_phone: cleanData.parentPhone,
+      })
+      .select()
+      .single();
+
+    if (parentRecord) {
+      await supabase.from('parent_students').insert({
+        parent_id: parentRecord.id,
+        student_id: studentRecord.id,
+        relationship: cleanData.parentRelationship || 'Ota-ona',
+        is_primary_payer: true,
+      });
+    }
+
+    // 4. Enroll in group if selected
+    if (cleanData.groupId) {
+      await supabase.from('group_students').insert({
+        student_id: studentRecord.id,
+        group_id: cleanData.groupId,
+        status: 'active',
+      });
+    }
+
+    return { success: true, studentRecord, studentCode };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "O'quvchi yaratishda kutilmagan xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
@@ -542,64 +554,88 @@ export async function updateStudentInSupabase(payload: {
   parentPhone?: string;
   notes?: string;
   groupId?: string;
-}) {
-  await requireAdminServerAuth();
-  const supabase = createServerSupabaseClient();
+}): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const supabase = createServerSupabaseClient();
 
-  const { error: profErr } = await supabase
-    .from('profiles')
-    .update({
-      full_name: payload.fullName.trim(),
-      phone: payload.phone.trim(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', payload.profileId);
-  if (profErr) throw new Error(profErr.message);
+    let cleanPhone = payload.phone.trim();
+    if (cleanPhone) {
+      const norm = normalizeUzPhone(cleanPhone);
+      if (!norm.valid) {
+        return { success: false, errorUz: norm.errorUz };
+      }
+      cleanPhone = norm.formatted;
+    }
 
-  const { error: stdErr } = await supabase
-    .from('students')
-    .update({
-      birth_date: payload.birthDate || null,
-      school_grade: payload.schoolGrade || null,
-      notes: payload.notes?.trim() || null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', payload.studentId);
-  if (stdErr) throw new Error(stdErr.message);
+    const { error: profErr } = await supabase
+      .from('profiles')
+      .update({
+        full_name: payload.fullName.trim(),
+        phone: cleanPhone,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.profileId);
+    if (profErr) return { success: false, errorUz: profErr.message };
 
-  if (payload.groupId) {
-    await assignStudentToGroupInSupabase(payload.studentId, payload.groupId);
+    const { error: stdErr } = await supabase
+      .from('students')
+      .update({
+        birth_date: payload.birthDate || null,
+        school_grade: payload.schoolGrade || null,
+        notes: payload.notes?.trim() || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.studentId);
+    if (stdErr) return { success: false, errorUz: stdErr.message };
+
+    if (payload.groupId) {
+      await assignStudentToGroupInSupabase(payload.studentId, payload.groupId);
+    }
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "O'quvchini yangilashda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
   }
-
-  return { success: true };
 }
 
 /**
  * 6. Deactivate or Activate Student Profile
  */
-export async function toggleStudentActiveStatus(profileId: string, isActive: boolean) {
-  await requireAdminServerAuth();
-  const supabase = createServerSupabaseClient();
+export async function toggleStudentActiveStatus(profileId: string, isActive: boolean): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const supabase = createServerSupabaseClient();
 
-  const { error } = await supabase
-    .from('profiles')
-    .update({ is_active: isActive, updated_at: new Date().toISOString() })
-    .eq('id', profileId);
+    const { error } = await supabase
+      .from('profiles')
+      .update({ is_active: isActive, updated_at: new Date().toISOString() })
+      .eq('id', profileId);
 
-  if (error) return getDemoStudentsList();
-  return { success: true };
+    if (error) return { success: false, errorUz: error.message };
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Holatni o'zgartirishda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
  * 7. Delete Student Record Permanently
  */
-export async function deleteStudentInSupabase(studentId: string, profileId: string) {
-  await requireAdminServerAuth();
-  const supabase = createServerSupabaseClient();
+export async function deleteStudentInSupabase(studentId: string, profileId: string): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const supabase = createServerSupabaseClient();
 
-  const { error } = await supabase.from('profiles').delete().eq('id', profileId);
-  if (error) throw new Error("O'quvchini o'chirishda xatolik: " + error.message);
-  return { success: true };
+    const { error } = await supabase.from('profiles').delete().eq('id', profileId);
+    if (error) return { success: false, errorUz: "O'quvchini o'chirishda xatolik: " + error.message };
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "O'chirishda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
@@ -678,42 +714,53 @@ export async function createTeacherInSupabase(payload: {
   specialization: CourseCategory;
   salaryRateUzs: number;
   bio?: string;
-}) {
-  await requireAdminServerAuth();
-  const valid = validateTeacherInput(payload);
-  if (!valid.success) throw new Error(valid.errorUz);
+}): Promise<{ success: boolean; teacher?: any; employeeCode?: string; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const valid = validateTeacherInput(payload);
+    if (!valid.success) {
+      return { success: false, errorUz: valid.errorUz };
+    }
 
-  const supabase = createServerSupabaseClient();
-  const clean = valid.data!;
+    const supabase = createServerSupabaseClient();
+    const clean = valid.data!;
 
-  const employeeCode = `TCH-${Math.floor(100 + Math.random() * 900)}`;
-  const profileId = crypto.randomUUID();
+    const employeeCode = `TCH-${Math.floor(100 + Math.random() * 900)}`;
+    const profileId = crypto.randomUUID();
 
-  const { error: profErr } = await supabase.from('profiles').insert({
-    id: profileId,
-    role: 'teacher' as UserRole,
-    full_name: clean.fullName,
-    phone: clean.phone,
-    email: clean.email,
-    is_active: true,
-  });
-  if (profErr) throw new Error("O'qituvchi profilini yaratishda xatolik: " + profErr.message);
+    const { error: profErr } = await supabase.from('profiles').insert({
+      id: profileId,
+      role: 'teacher' as UserRole,
+      full_name: clean.fullName,
+      phone: clean.phone,
+      email: clean.email,
+      is_active: true,
+    });
+    if (profErr) {
+      return { success: false, errorUz: "O'qituvchi profilini yaratishda xatolik: " + profErr.message };
+    }
 
-  const { data: teacher, error: tchErr } = await supabase
-    .from('teachers')
-    .insert({
-      profile_id: profileId,
-      employee_code: employeeCode,
-      specialization: clean.specialization,
-      salary_rate_uzs: clean.salaryRateUzs,
-      bio: clean.bio || null,
-      hired_at: new Date().toISOString().slice(0, 10),
-    })
-    .select()
-    .single();
+    const { data: teacher, error: tchErr } = await supabase
+      .from('teachers')
+      .insert({
+        profile_id: profileId,
+        employee_code: employeeCode,
+        specialization: clean.specialization,
+        salary_rate_uzs: clean.salaryRateUzs,
+        bio: clean.bio || null,
+        hired_at: new Date().toISOString().slice(0, 10),
+      })
+      .select()
+      .single();
 
-  if (tchErr) throw new Error("O'qituvchi ma'lumotlarini saqlashda xatolik: " + tchErr.message);
-  return teacher;
+    if (tchErr) {
+      return { success: false, errorUz: "O'qituvchi ma'lumotlarini saqlashda xatolik: " + tchErr.message };
+    }
+    return { success: true, teacher, employeeCode };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "O'qituvchi yaratishda kutilmagan xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
@@ -727,32 +774,46 @@ export async function updateTeacherInSupabase(payload: {
   specialization: CourseCategory;
   salaryRateUzs: number;
   bio?: string;
-}) {
-  await requireAdminServerAuth();
-  const supabase = createServerSupabaseClient();
+}): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const supabase = createServerSupabaseClient();
 
-  const { error: profErr } = await supabase
-    .from('profiles')
-    .update({
-      full_name: payload.fullName.trim(),
-      phone: payload.phone.trim(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', payload.profileId);
-  if (profErr) throw new Error(profErr.message);
+    let cleanPhone = payload.phone.trim();
+    if (cleanPhone) {
+      const norm = normalizeUzPhone(cleanPhone);
+      if (!norm.valid) {
+        return { success: false, errorUz: norm.errorUz };
+      }
+      cleanPhone = norm.formatted;
+    }
 
-  const { error: tchErr } = await supabase
-    .from('teachers')
-    .update({
-      specialization: payload.specialization,
-      salary_rate_uzs: payload.salaryRateUzs,
-      bio: payload.bio?.trim() || null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', payload.teacherId);
-  if (tchErr) throw new Error(tchErr.message);
+    const { error: profErr } = await supabase
+      .from('profiles')
+      .update({
+        full_name: payload.fullName.trim(),
+        phone: cleanPhone,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.profileId);
+    if (profErr) return { success: false, errorUz: profErr.message };
 
-  return { success: true };
+    const { error: tchErr } = await supabase
+      .from('teachers')
+      .update({
+        specialization: payload.specialization,
+        salary_rate_uzs: payload.salaryRateUzs,
+        bio: payload.bio?.trim() || null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.teacherId);
+    if (tchErr) return { success: false, errorUz: tchErr.message };
+
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "O'qituvchini yangilashda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
@@ -930,31 +991,36 @@ export async function createCourseInSupabase(payload: {
   lessonsPerWeek: number;
   monthlyFeeUzs: number;
   descriptionUz?: string;
-}) {
-  await requireAdminServerAuth();
-  const valid = validateCourseInput(payload);
-  if (!valid.success) throw new Error(valid.errorUz);
+}): Promise<{ success: boolean; course?: any; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const valid = validateCourseInput(payload);
+    if (!valid.success) return { success: false, errorUz: valid.errorUz };
 
-  const supabase = createServerSupabaseClient();
-  const clean = valid.data!;
+    const supabase = createServerSupabaseClient();
+    const clean = valid.data!;
 
-  const { data, error } = await supabase
-    .from('courses')
-    .insert({
-      code: clean.code,
-      title_uz: clean.titleUz,
-      category: clean.category,
-      duration_months: clean.durationMonths,
-      lessons_per_week: clean.lessonsPerWeek,
-      monthly_fee_uzs: clean.monthlyFeeUzs,
-      description_uz: clean.descriptionUz || null,
-      is_active: true,
-    })
-    .select()
-    .single();
+    const { data, error } = await supabase
+      .from('courses')
+      .insert({
+        code: clean.code,
+        title_uz: clean.titleUz,
+        category: clean.category,
+        duration_months: clean.durationMonths,
+        lessons_per_week: clean.lessonsPerWeek,
+        monthly_fee_uzs: clean.monthlyFeeUzs,
+        description_uz: clean.descriptionUz || null,
+        is_active: true,
+      })
+      .select()
+      .single();
 
-  if (error) return getDemoStudentsList();
-  return data;
+    if (error) return { success: false, errorUz: error.message };
+    return { success: true, course: data };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Kurs yaratishda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**
@@ -966,28 +1032,33 @@ export async function updateCourseInSupabase(payload: {
   monthlyFeeUzs: number;
   durationMonths: number;
   lessonsPerWeek: number;
-}) {
-  await requireAdminServerAuth();
-  if (payload.monthlyFeeUzs < 50000) {
-    throw new Error("Kurs narxi kamida 50 000 so'm bo'lishi kerak.");
+}): Promise<{ success: boolean; course?: any; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    if (payload.monthlyFeeUzs < 50000) {
+      return { success: false, errorUz: "Kurs narxi kamida 50 000 so'm bo'lishi kerak." };
+    }
+
+    const supabase = createServerSupabaseClient();
+    const { data, error } = await supabase
+      .from('courses')
+      .update({
+        title_uz: payload.titleUz.trim(),
+        monthly_fee_uzs: payload.monthlyFeeUzs,
+        duration_months: payload.durationMonths,
+        lessons_per_week: payload.lessonsPerWeek,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', payload.courseId)
+      .select()
+      .single();
+
+    if (error) return { success: false, errorUz: error.message };
+    return { success: true, course: data };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Kursni yangilashda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
   }
-
-  const supabase = createServerSupabaseClient();
-  const { data, error } = await supabase
-    .from('courses')
-    .update({
-      title_uz: payload.titleUz.trim(),
-      monthly_fee_uzs: payload.monthlyFeeUzs,
-      duration_months: payload.durationMonths,
-      lessons_per_week: payload.lessonsPerWeek,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', payload.courseId)
-    .select()
-    .single();
-
-  if (error) return getDemoStudentsList();
-  return data;
 }
 
 export async function updateCoursePriceInSupabase(courseId: string, monthlyFeeUzs: number) {
@@ -1013,91 +1084,102 @@ export async function createGroupInSupabase(payload: {
   startTime: string;
   endTime: string;
   maxStudents: number;
-}) {
-  await requireAdminServerAuth();
-  const valid = validateGroupInput(payload);
-  if (!valid.success) throw new Error(valid.errorUz);
+}): Promise<{ success: boolean; group?: any; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const valid = validateGroupInput(payload);
+    if (!valid.success) return { success: false, errorUz: valid.errorUz };
 
-  const supabase = createServerSupabaseClient();
-  const clean = valid.data!;
+    const supabase = createServerSupabaseClient();
+    const clean = valid.data!;
 
-  // Conflict check with existing groups
-  const { data: conflicts } = await supabase
-    .from('groups')
-    .select('id, code, name, room, teacher_id')
-    .eq('status', 'active')
-    .eq('schedule_days', clean.scheduleDays)
-    .or(`room.eq.${clean.room},teacher_id.eq.${clean.teacherId}`)
-    .filter('start_time', 'lt', clean.endTime)
-    .filter('end_time', 'gt', clean.startTime);
+    // Conflict check with existing groups
+    const { data: conflicts } = await supabase
+      .from('groups')
+      .select('id, code, name, room, teacher_id')
+      .eq('status', 'active')
+      .eq('schedule_days', clean.scheduleDays)
+      .or(`room.eq.${clean.room},teacher_id.eq.${clean.teacherId}`)
+      .filter('start_time', 'lt', clean.endTime)
+      .filter('end_time', 'gt', clean.startTime);
 
-  if (conflicts && conflicts.length > 0) {
-    const c = conflicts[0];
-    const isRoom = c.room === clean.room;
-    throw new Error(
-      `Jadval to'qnashuvi aniqlandi: ${c.code} (${c.name}) guruhi ushbu vaqtda ` +
-        (isRoom ? `'${clean.room}' xonasini band qilgan.` : "ushbu o'qituvchiga dars belgilangan.")
-    );
+    if (conflicts && conflicts.length > 0) {
+      const c = conflicts[0];
+      const isRoom = c.room === clean.room;
+      return {
+        success: false,
+        errorUz: `Jadval to'qnashuvi aniqlandi: ${c.code} (${c.name}) guruhi ushbu vaqtda ` +
+          (isRoom ? `'${clean.room}' xonasini band qilgan.` : "ushbu o'qituvchiga dars belgilangan."),
+      };
+    }
+
+    const { data, error } = await supabase
+      .from('groups')
+      .insert({
+        code: clean.code,
+        name: clean.name,
+        course_id: clean.courseId,
+        teacher_id: clean.teacherId,
+        room: clean.room,
+        schedule_days: clean.scheduleDays,
+        start_time: clean.startTime,
+        end_time: clean.endTime,
+        max_students: clean.maxStudents,
+        status: 'active',
+        start_date: new Date().toISOString().slice(0, 10),
+      })
+      .select()
+      .single();
+
+    if (error) return { success: false, errorUz: error.message };
+    return { success: true, group: data };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Guruh yaratishda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
   }
-
-  const { data, error } = await supabase
-    .from('groups')
-    .insert({
-      code: clean.code,
-      name: clean.name,
-      course_id: clean.courseId,
-      teacher_id: clean.teacherId,
-      room: clean.room,
-      schedule_days: clean.scheduleDays,
-      start_time: clean.startTime,
-      end_time: clean.endTime,
-      max_students: clean.maxStudents,
-      status: 'active',
-      start_date: new Date().toISOString().slice(0, 10),
-    })
-    .select()
-    .single();
-
-  if (error) return getDemoStudentsList();
-  return data;
 }
 
 /**
  * 16. Assign Student to Group with Capacity Enforcement
  */
-export async function assignStudentToGroupInSupabase(studentId: string, groupId: string) {
-  await requireAdminServerAuth();
-  const supabase = createServerSupabaseClient();
+export async function assignStudentToGroupInSupabase(studentId: string, groupId: string): Promise<{ success: boolean; errorUz?: string }> {
+  try {
+    await requireAdminServerAuth();
+    const supabase = createServerSupabaseClient();
 
-  // Check group capacity
-  const { data: group, error: grpErr } = await supabase
-    .from('groups')
-    .select('id, code, max_students, group_students(id)')
-    .eq('id', groupId)
-    .single();
+    // Check group capacity
+    const { data: group, error: grpErr } = await supabase
+      .from('groups')
+      .select('id, code, max_students, group_students(id)')
+      .eq('id', groupId)
+      .single();
 
-  if (grpErr || !group) throw new Error("Guruh topilmadi.");
+    if (grpErr || !group) return { success: false, errorUz: "Guruh topilmadi." };
 
-  const currentCount = (group.group_students || []).length;
-  if (currentCount >= group.max_students) {
-    throw new Error(`Guruh to'lgan (${currentCount}/${group.max_students} o'quvchi). Boshqa guruhni tanlang.`);
+    const currentCount = (group.group_students || []).length;
+    if (currentCount >= group.max_students) {
+      return { success: false, errorUz: `Guruh to'lgan (${currentCount}/${group.max_students} o'quvchi). Boshqa guruhni tanlang.` };
+    }
+
+    const { error } = await supabase
+      .from('group_students')
+      .upsert(
+        {
+          student_id: studentId,
+          group_id: groupId,
+          status: 'active',
+        },
+        { onConflict: 'group_id,student_id' }
+      )
+      .select()
+      .single();
+
+    if (error) return { success: false, errorUz: error.message };
+    return { success: true };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Guruhga biriktirishda xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
   }
-
-  const { data, error } = await supabase
-    .from('group_students')
-    .upsert(
-      {
-        student_id: studentId,
-        group_id: groupId,
-        status: 'active',
-      },
-      { onConflict: 'group_id,student_id' }
-    )
-    .select()
-    .single();
-
-  if (error) return getDemoStudentsList();
-  return data;
 }
 
 /**
@@ -1175,38 +1257,43 @@ export async function recordPaymentInSupabase(payload: {
   paymentMethod: PaymentMethod;
   status: PaymentStatus;
   notes?: string;
-}) {
-  const { adminProfileId } = await requireAdminServerAuth();
-  const valid = validatePaymentInput(payload);
-  if (!valid.success) throw new Error(valid.errorUz);
+}): Promise<{ success: boolean; payment?: any; invoiceNumber?: string; errorUz?: string }> {
+  try {
+    const { adminProfileId } = await requireAdminServerAuth();
+    const valid = validatePaymentInput(payload);
+    if (!valid.success) return { success: false, errorUz: valid.errorUz };
 
-  const supabase = createServerSupabaseClient();
-  const clean = valid.data!;
+    const supabase = createServerSupabaseClient();
+    const clean = valid.data!;
 
-  const invoiceNumber = `INV-${clean.billingMonth.replace(/-/g, '').slice(0, 6)}-${Math.floor(
-    10000 + Math.random() * 90000
-  )}`;
+    const invoiceNumber = `INV-${clean.billingMonth.replace(/-/g, '').slice(0, 6)}-${Math.floor(
+      10000 + Math.random() * 90000
+    )}`;
 
-  const { data, error } = await supabase
-    .from('payments')
-    .insert({
-      invoice_number: invoiceNumber,
-      student_id: clean.studentId,
-      group_id: clean.groupId,
-      billing_month: clean.billingMonth,
-      amount_due_uzs: clean.amountDueUzs,
-      amount_paid_uzs: clean.amountPaidUzs,
-      payment_method: clean.paymentMethod,
-      status: clean.status,
-      paid_at: clean.amountPaidUzs > 0 ? new Date().toISOString() : null,
-      recorded_by: adminProfileId,
-      notes: clean.notes || null,
-    })
-    .select()
-    .single();
+    const { data, error } = await supabase
+      .from('payments')
+      .insert({
+        invoice_number: invoiceNumber,
+        student_id: clean.studentId,
+        group_id: clean.groupId,
+        billing_month: clean.billingMonth,
+        amount_due_uzs: clean.amountDueUzs,
+        amount_paid_uzs: clean.amountPaidUzs,
+        payment_method: clean.paymentMethod,
+        status: clean.status,
+        paid_at: clean.amountPaidUzs > 0 ? new Date().toISOString() : null,
+        recorded_by: adminProfileId,
+        notes: clean.notes || null,
+      })
+      .select()
+      .single();
 
-  if (error) throw new Error("To'lovni saqlashda xatolik: " + error.message);
-  return data;
+    if (error) return { success: false, errorUz: "To'lovni saqlashda xatolik: " + error.message };
+    return { success: true, payment: data, invoiceNumber };
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "To'lovni saqlashda kutilmagan xatolik yuz berdi.";
+    return { success: false, errorUz: msg };
+  }
 }
 
 /**

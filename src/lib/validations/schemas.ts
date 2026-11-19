@@ -14,6 +14,54 @@ export interface ValidationResult<T> {
 const UZ_PHONE_REGEX = /^\+998\s?\d{2}\s?\d{3}\s?\d{2}\s?\d{2}$/;
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/**
+ * Normalizes any Uzbek phone number into the standard "+998 XX XXX XX XX" format.
+ * Accepts formats like:
+ * - "+998 90 123 45 67"
+ * - "+998901234567"
+ * - "998901234567"
+ * - "90 123 45 67"
+ * - "901234567"
+ * - "+998 (90) 123-45-67"
+ */
+export function normalizeUzPhone(input: string): { valid: boolean; formatted: string; rawDigits: string; errorUz?: string } {
+  if (!input || typeof input !== 'string') {
+    return {
+      valid: false,
+      formatted: '',
+      rawDigits: '',
+      errorUz: "Telefon raqami kiritilmadi.",
+    };
+  }
+
+  const digits = input.trim().replace(/\D/g, '');
+
+  let raw = '';
+  if (digits.startsWith('998') && digits.length === 12) {
+    raw = digits;
+  } else if (digits.length === 9) {
+    raw = '998' + digits;
+  } else if (digits.length === 10 && digits.startsWith('8')) {
+    raw = '998' + digits.slice(1);
+  } else {
+    return {
+      valid: false,
+      formatted: '',
+      rawDigits: digits,
+      errorUz: "Telefon raqami 9 ta yoki 12 ta raqamdan iborat bo'lishi kerak (masalan: +998 90 123 45 67 yoki 90 123 45 67).",
+    };
+  }
+
+  const cc = raw.slice(0, 3);
+  const operator = raw.slice(3, 5);
+  const part1 = raw.slice(5, 8);
+  const part2 = raw.slice(8, 10);
+  const part3 = raw.slice(10, 12);
+  const formatted = `+${cc} ${operator} ${part1} ${part2} ${part3}`;
+
+  return { valid: true, formatted, rawDigits: raw };
+}
+
 export function validateEmailPasswordInput(
   email: string,
   password: string
@@ -43,27 +91,34 @@ export function validateStudentInput(input: {
   if (!input.fullName || input.fullName.trim().length < 4) {
     return { success: false, errorUz: "O'quvchi F.I.Sh. kamida 4 ta harfdan iborat bo'lishi kerak." };
   }
-  if (!UZ_PHONE_REGEX.test(input.phone.trim())) {
-    return { success: false, errorUz: "Telefon raqami +998 XX XXX XX XX formatida bo'lishi kerak." };
+
+  const phoneNorm = normalizeUzPhone(input.phone);
+  if (!phoneNorm.valid) {
+    return { success: false, errorUz: phoneNorm.errorUz || "Telefon raqami noto'g'ri kiritildi." };
   }
+
   if (!input.parentName || input.parentName.trim().length < 3) {
     return { success: false, errorUz: "Ota-ona F.I.Sh. kamida 3 ta belgidan iborat bo'lishi shart." };
   }
-  if (!UZ_PHONE_REGEX.test(input.parentPhone.trim())) {
-    return { success: false, errorUz: "Ota-ona telefon raqami +998 XX XXX XX XX formatida bo'lishi kerak." };
+
+  const parentPhoneNorm = normalizeUzPhone(input.parentPhone);
+  if (!parentPhoneNorm.valid) {
+    return { success: false, errorUz: `Ota-ona telefon raqami: ${parentPhoneNorm.errorUz || "noto'g'ri kiritildi."}` };
   }
+
   if (input.email && !EMAIL_REGEX.test(input.email.trim())) {
     return { success: false, errorUz: "O'quvchi elektron pochtasi noto'g'ri formatda." };
   }
+
   return {
     success: true,
     data: {
       ...input,
       fullName: input.fullName.trim(),
-      phone: input.phone.trim(),
+      phone: phoneNorm.formatted,
       email: input.email ? input.email.trim().toLowerCase() : undefined,
       parentName: input.parentName.trim(),
-      parentPhone: input.parentPhone.trim(),
+      parentPhone: parentPhoneNorm.formatted,
       parentRelationship: input.parentRelationship?.trim() || 'Ota-ona',
       notes: input.notes?.trim() || '',
     },
@@ -81,9 +136,12 @@ export function validateTeacherInput(input: {
   if (!input.fullName || input.fullName.trim().length < 4) {
     return { success: false, errorUz: "O'qituvchi F.I.Sh. kamida 4 ta harfdan iborat bo'lishi kerak." };
   }
-  if (!UZ_PHONE_REGEX.test(input.phone.trim())) {
-    return { success: false, errorUz: "O'qituvchi telefon raqami +998 XX XXX XX XX formatida bo'lishi kerak." };
+
+  const phoneNorm = normalizeUzPhone(input.phone);
+  if (!phoneNorm.valid) {
+    return { success: false, errorUz: phoneNorm.errorUz || "O'qituvchi telefon raqami noto'g'ri kiritildi." };
   }
+
   if (!EMAIL_REGEX.test(input.email.trim().toLowerCase())) {
     return { success: false, errorUz: "O'qituvchi elektron pochtasi noto'g'ri kiritildi." };
   }
@@ -95,7 +153,7 @@ export function validateTeacherInput(input: {
     data: {
       ...input,
       fullName: input.fullName.trim(),
-      phone: input.phone.trim(),
+      phone: phoneNorm.formatted,
       email: input.email.trim().toLowerCase(),
       bio: input.bio?.trim() || '',
     },
